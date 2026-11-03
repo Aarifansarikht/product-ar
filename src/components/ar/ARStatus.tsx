@@ -27,7 +27,13 @@ const SURFACE_COPY: Record<PlacementType, { noun: string; pointAt: string; still
 /** Contextual instruction for the current phase, or null to hide it. */
 function instructionFor(state: ARState, placedHintVisible: boolean): { text: string; sub?: string; tone: 'info' | 'warn' } | null {
   if (state.tracking === 'lost') {
-    return { text: 'Tracking lost. Move your camera slowly to scan the room again.', tone: 'warn' }
+    return state.phase === 'placed'
+      ? {
+          text: 'Too close to track. Step back a little.',
+          sub: 'Keep some of the floor or wall around the product in view.',
+          tone: 'warn',
+        }
+      : { text: 'Tracking lost. Move your camera slowly to scan the room again.', tone: 'warn' }
   }
   const placement = state.product?.placement ?? 'floor'
   const surface = SURFACE_COPY[placement]

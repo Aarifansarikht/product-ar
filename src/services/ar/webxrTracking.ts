@@ -246,5 +246,7 @@ export class WebXRTracking {
       session.end().catch(() => undefined)
     }
     this.renderer.dispose()
+    // Free the GL context right away instead of leaving it for the garbage collector.
+    this.renderer.forceContextLoss()
   }
 }

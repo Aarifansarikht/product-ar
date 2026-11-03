@@ -58,7 +58,7 @@ export function ARViewer({ product, onExit, onProductChange }: ARViewerProps) {
   return (
     <motion.div
       ref={rootRef}
-      className={`fixed inset-0 z-40 overflow-hidden select-none ${nativeAR ? 'bg-transparent' : 'bg-black'}`}
+      className={`ar-live fixed inset-0 z-40 overflow-hidden select-none ${nativeAR ? 'bg-transparent' : 'bg-black'}`}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}

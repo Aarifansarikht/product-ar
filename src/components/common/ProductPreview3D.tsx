@@ -92,6 +92,8 @@ export function ProductPreview3D({ product, onClose, onViewInAR }: ProductPrevie
       env.dispose()
       key.dispose()
       renderer.dispose()
+      // Each preview opens a new context; release this one now so they never pile up.
+      renderer.forceContextLoss()
       renderer.domElement.remove()
     }
   }, [model])

@@ -14,17 +14,25 @@ interface ARAdjustPadProps {
 }
 
 const REPEAT_DELAY_MS = 320
-const REPEAT_EVERY_MS = 55
+const REPEAT_EVERY_MS = 80
+/** A hold never repeats longer than this, even if the finger-up event is lost. */
+const MAX_REPEAT_MS = 3000
 
 /** Arrow that nudges once on press and keeps nudging while held. */
 function NudgeButton({ label, disabled, onStep, children }: { label: string; disabled?: boolean; onStep: () => void; children: ReactNode }) {
-  const timers = useRef<{ delay?: number; repeat?: number }>({})
+  const timers = useRef<{ delay?: number; repeat?: number; startedAt?: number }>({})
+  const step = useRef(onStep)
+  step.current = onStep
   const stop = () => {
     window.clearTimeout(timers.current.delay)
     window.clearInterval(timers.current.repeat)
     timers.current = {}
   }
   useEffect(() => stop, [])
+  // A disabled button gets no pointer events, so its finger-up would never arrive.
+  useEffect(() => {
+    if (disabled) stop()
+  }, [disabled])
 
   return (
     <button
@@ -34,16 +42,28 @@ function NudgeButton({ label, disabled, onStep, children }: { label: string; dis
       disabled={disabled}
       onPointerDown={(e) => {
         e.preventDefault()
-        onStep()
+        stop() // never stack a second repeat on top of one still running
+        try {
+          e.currentTarget.setPointerCapture(e.pointerId)
+        } catch {
+          // Capture is best-effort; MAX_REPEAT_MS still ends the repeat.
+        }
+        step.current()
+        timers.current.startedAt = performance.now()
         timers.current.delay = window.setTimeout(() => {
-          timers.current.repeat = window.setInterval(onStep, REPEAT_EVERY_MS)
+          timers.current.repeat = window.setInterval(() => {
+            if (performance.now() - (timers.current.startedAt ?? 0) > MAX_REPEAT_MS) return stop()
+            step.current()
+          }, REPEAT_EVERY_MS)
         }, REPEAT_DELAY_MS)
       }}
       onPointerUp={stop}
+      onLostPointerCapture={stop}
       onPointerLeave={stop}
       onPointerCancel={stop}
       onContextMenu={(e) => e.preventDefault()}
-      className="flex h-11 w-11 items-center justify-center rounded-lg text-white/90 transition active:scale-90 active:bg-white/15 disabled:pointer-events-none disabled:opacity-25"
+      // A long press must stay a plain press: no callout, text selection or browser gesture.
+      className="flex h-11 w-11 touch-none items-center justify-center rounded-lg text-white/90 transition select-none [-webkit-touch-callout:none] active:scale-90 active:bg-white/15 disabled:pointer-events-none disabled:opacity-25"
     >
       {children}
     </button>

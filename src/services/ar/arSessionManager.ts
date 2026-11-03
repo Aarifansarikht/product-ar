@@ -27,6 +27,11 @@ import { WebXRTracking } from './webxrTracking'
 /** After a wall placement, keep re-fitting the wall for this long as more points are tracked. */
 const WALL_SETTLE_MS = 3500
 const UP = new THREE.Vector3(0, 1, 0)
+
+/** How well a wall hit is measured: 0 = assumed wall, 1 = feature point (no real angle), 2 = fitted/detected plane. */
+const wallFitOf = (hit: SurfaceHit) =>
+  !hit.confirmed ? 0 : hit.type === 'FEATURE_POINT' || hit.type === 'XR_POINT' ? 1 : 2
+
 const DEBUG = new URLSearchParams(window.location.search).has('xrdebug')
 
 export type ARPhase =
@@ -101,8 +106,17 @@ export const AR_INITIAL_STATE: ARState = {
 const NO_SURFACE_HINT_MS = 14_000
 const HEIGHT_SETTLE_MS = 6000
 const NUDGE_STEP = 0.01
-/** The product stays visible through tracking drops shorter than this. */
-const LOST_HIDE_AFTER_MS = 2500
+/** The user's floor/table height correction is limited to this, in metres. */
+const MAX_SURFACE_OFFSET = 0.4
+/** An adjusted surface point farther than this is a near-horizon ray, not a usable spot. */
+const MAX_ADJUSTED_DISTANCE = 6
+/** After the last nudge, wait this long before re-anchoring (native AR). */
+const NUDGE_ANCHOR_DELAY_MS = 400
+/**
+ * Tracking must stay degraded this long before it is reported as lost. Short drops are common
+ * up close or on plain walls, and flashing a warning for each one makes tracking look broken.
+ */
+const LOST_REPORT_MS = 1200
 /** Plain walls can take a while to show any trackable detail, so keep trying longer. */
 const WALL_GUESS_SETTLE_MS = 20_000
 const HIT_TEST_EVERY_N_FRAMES = 2
@@ -244,8 +258,12 @@ export class ARSessionManager {
   private wallDepth = DEFAULT_WALL_DEPTH
   /** User correction of the floor/table height (Adjust ↑↓), in metres. */
   private surfaceOffset = 0
-  /** When tracking was lost (0 = tracking). */
-  private lostSince = 0
+  /** How well the wall the art hangs on is measured (see `wallFitOf`). */
+  private wallFit = 0
+  /** When tracking became limited (0 = tracking normally). */
+  private limitedSince = 0
+  /** Pending re-anchor after fine adjustment (see `nudge`). */
+  private anchorTimer: number | undefined
   private readonly lights = new THREE.Group()
   private envTexture: THREE.Texture | null = null
   private hemi: THREE.HemisphereLight | null = null
@@ -431,7 +449,8 @@ export class ARSessionManager {
     this.gestures = new TouchGestures(gestureSurface, {
       // Only a touch that lands on the product grabs it; touching empty space never moves it.
       onPressStart: (x, y) => {
-        const grabbed = !!this.xr && this.manipulator.beginDrag(this.toNdc(x, y), this.xr.camera)
+        // While tracking is lost the camera pose is unreliable, so a drag would move it wrongly.
+        const grabbed = !!this.xr && this.state.tracking !== 'lost' && this.manipulator.beginDrag(this.toNdc(x, y), this.xr.camera)
         if (grabbed) this.setGrabbing(true)
         return grabbed
       },
@@ -467,6 +486,7 @@ export class ARSessionManager {
     if (this.disposed) return
     this.disposed = true
     this.modelRequest++
+    window.clearTimeout(this.anchorTimer)
     window.removeEventListener('resize', this.resizeCanvas)
     this.gestures?.dispose()
     this.gestures = null
@@ -475,6 +495,9 @@ export class ARSessionManager {
       try {
         this.XR8.stop()
         this.XR8.clearCameraPipelineModules()
+        // Release the GL context now; each AR entry gets a fresh canvas, and contexts left for the
+        // garbage collector pile up and crash the tab on phones.
+        this.xr?.renderer.forceContextLoss()
       } catch (err) {
         console.warn('[AR] error while stopping XR8', err)
       }
@@ -557,6 +580,7 @@ export class ARSessionManager {
     const step = NUDGE_STEP * direction
     const wall = product.placement === 'wall'
     if (axis === 'y' && !wall) {
+      if (Math.abs(this.surfaceOffset + step) > MAX_SURFACE_OFFSET) return
       this.surfaceOffset += step
       this.set({ surfaceOffset: Math.round(this.surfaceOffset * 100) / 100 })
     }
@@ -578,7 +602,15 @@ export class ARSessionManager {
     }
     this.heightSettleUntil = 0 // the user's adjustment wins over automatic height settling
     this.manipulator.shift(delta)
-    this.webxr?.setAnchor(this.manipulator.position)
+    // Holding an arrow nudges ~12 times a second. Re-creating the native anchor on every step
+    // floods ARCore with anchor create/delete calls (which can crash the AR session), so the
+    // anchor follows once the user lets go.
+    if (this.webxr) {
+      window.clearTimeout(this.anchorTimer)
+      this.anchorTimer = window.setTimeout(() => {
+        if (!this.disposed && this.manipulator.isPlaced) this.webxr?.setAnchor(this.manipulator.position)
+      }, NUDGE_ANCHOR_DELAY_MS)
+    }
   }
 
   resetPlacement() {
@@ -719,8 +751,9 @@ export class ARSessionManager {
     if (product.placement === 'wall' && !this.webxr) this.wallSettleUntil = performance.now() + WALL_SETTLE_MS
     // Placed on the assumed surface height: drop/raise it onto the real one once it is measured.
     this.heightSettleUntil = !hit.confirmed && product.placement !== 'wall' ? performance.now() + HEIGHT_SETTLE_MS : 0
-    // Hung on an assumed wall: move onto the real wall once it is measured.
-    this.wallGuessUntil = !hit.confirmed && product.placement === 'wall' ? performance.now() + WALL_GUESS_SETTLE_MS : 0
+    // Hung on an assumed wall or a single feature point: move onto the real wall plane once it is measured.
+    this.wallFit = product.placement === 'wall' ? wallFitOf(hit) : 0
+    this.wallGuessUntil = product.placement === 'wall' && this.wallFit < 2 ? performance.now() + WALL_GUESS_SETTLE_MS : 0
     this.navigatorVibrate()
     this.set({ phase: 'placed', needsReplacement: false, noSurfaceHint: false, scale: product.defaultScale })
   }
@@ -746,10 +779,16 @@ export class ARSessionManager {
     // so the marker stays under the screen point.
     const camPos = this.xr.camera.position
     const dir = hit.position.clone().sub(camPos)
-    const t = (hit.position.y + this.surfaceOffset - camPos.y) / dir.y
-    if (!Number.isFinite(t) || t <= 0) return hit
+    // Raised to (or above) the camera, the ray barely meets the surface and the point would land
+    // far away (or behind), so there is no usable spot there.
+    const surfaceY = hit.position.y + this.surfaceOffset
+    if (dir.y > -1e-3 || surfaceY > camPos.y - 0.05) return null
+    const t = (surfaceY - camPos.y) / dir.y
+    if (!Number.isFinite(t) || t <= 0) return null
     const position = camPos.clone().addScaledVector(dir, t)
-    return { ...hit, position, distance: position.distanceTo(camPos) }
+    const distance = position.distanceTo(camPos)
+    if (distance > MAX_ADJUSTED_DISTANCE) return null
+    return { ...hit, position, distance }
   }
 
   private findRawSurface(screenX: number, screenY: number, reticle: boolean, assume: boolean): SurfaceHit | null {
@@ -788,9 +827,9 @@ export class ARSessionManager {
   }
 
   /**
-   * Art placed on an assumed wall (plain wall, nothing tracked) moves onto the real wall as soon
-   * as it is measured: along the view ray through the art, so it stays where the user put it on
-   * screen and only its depth and angle are corrected.
+   * Art placed on an assumed wall (plain wall, nothing tracked) or on a single feature point moves
+   * onto the real wall as soon as a better measurement exists: along the view ray through the art,
+   * so it stays where the user put it on screen and only its depth and angle are corrected.
    */
   private settleGuessedWall(now: number) {
     if (!this.xr || this.manipulator.isDragging) return
@@ -807,13 +846,16 @@ export class ARSessionManager {
       if (Math.abs(s.x) > 1 || Math.abs(s.y) > 1 || s.z > 1) return // art is off screen
       hit = this.findSurface((s.x + 1) / 2, (1 - s.y) / 2, false, false)
     }
-    if (!hit?.confirmed) return
+    const fit = hit ? wallFitOf(hit) : 0
+    if (!hit || fit <= this.wallFit) return
     const normal = UP.clone().applyQuaternion(hit.surfaceRotation)
     const wall = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, hit.position)
     const dir = this.manipulator.position.clone().sub(camera.position).normalize()
     const onWall = new THREE.Ray(camera.position.clone(), dir).intersectPlane(wall, new THREE.Vector3())
-    if (!onWall || onWall.distanceTo(this.manipulator.position) > 2.5) return // a different surface
-    this.wallGuessUntil = 0
+    // A different surface. Art on a measured point is already at the right depth, so only small moves count.
+    if (!onWall || onWall.distanceTo(this.manipulator.position) > (this.wallFit ? 0.5 : 2.5)) return
+    this.wallFit = fit
+    if (fit === 2) this.wallGuessUntil = 0
     this.manipulator.refineAnchor(onWall, Math.atan2(normal.x, normal.z))
     this.webxr?.setAnchor(onWall)
     if (!this.webxr) this.wallSettleUntil = now + WALL_SETTLE_MS // keep refining as points accumulate
@@ -935,6 +977,7 @@ export class ARSessionManager {
 
   private onTrackingStatus(status: XR8TrackingStatus | undefined, reason: XR8TrackingReason | undefined) {
     if (status === 'NORMAL') {
+      this.limitedSince = 0
       const patch: Partial<ARState> = { tracking: 'normal', trackingReason: null }
       if (this.state.phase === 'initializing' || this.state.phase === 'requesting-camera') {
         patch.phase = 'scanning'
@@ -942,11 +985,10 @@ export class ARSessionManager {
       }
       this.set(patch)
     } else if (status === 'LIMITED') {
+      // Reported as lost only if it stays limited (see LOST_REPORT_MS, checked in onUpdate).
       const hadTracking = this.state.tracking !== 'initializing'
-      this.set({
-        tracking: hadTracking && reason !== 'INITIALIZING' ? 'lost' : this.state.tracking,
-        trackingReason: reason ?? null,
-      })
+      if (hadTracking && reason !== 'INITIALIZING') this.limitedSince ||= performance.now()
+      this.set({ trackingReason: reason ?? null })
     }
   }
 
@@ -960,13 +1002,11 @@ export class ARSessionManager {
     this.monitorPerformance(now)
     this.applyLightEstimate(processCpuResult, dt)
 
-    // While tracking is lost the pose is unreliable: hide the product rather than show it drifting
-    // or at the wrong size. It reappears on its anchor as soon as tracking recovers.
-    // Brief drops are common up close (the camera sees mostly plain floor or the area under the
-    // product), so keep showing it on its anchor and hide only if tracking stays lost.
-    if (this.state.tracking !== 'lost') this.lostSince = 0
-    else this.lostSince ||= now
-    this.content.visible = !this.lostSince || now - this.lostSince < LOST_HIDE_AFTER_MS
+    // The product always stays on its anchor, even while tracking is limited. Tracking drops all
+    // the time up close (the camera sees only plain floor, wall or the product itself), and hiding
+    // the product then made close-up inspection impossible. The banner explains a sustained loss.
+    if (this.limitedSince && this.state.tracking === 'normal' && now - this.limitedSince > LOST_REPORT_MS)
+      this.set({ tracking: 'lost' })
 
     // Wall fitting from the 8th Wall point cloud; native AR detects vertical planes itself.
     const onWall = this.state.product?.placement === 'wall' && !this.webxr
@@ -994,8 +1034,10 @@ export class ARSessionManager {
       )
         this.set({ noSurfaceHint: true })
     }
-    if (!placing && this.heightSettleUntil > now && this.frame % HIT_TEST_EVERY_N_FRAMES === 0) this.settleHeight(now)
-    if (!placing && this.wallGuessUntil > 0 && this.frame % 6 === 0) this.settleGuessedWall(now)
+    // Settling measures against the camera pose, so it waits while tracking is lost.
+    const settling = !placing && this.state.tracking !== 'lost'
+    if (settling && this.heightSettleUntil > now && this.frame % HIT_TEST_EVERY_N_FRAMES === 0) this.settleHeight(now)
+    if (settling && this.wallGuessUntil > 0 && this.frame % 6 === 0) this.settleGuessedWall(now)
 
     const camPos = this.xr.camera.position
     // The reticle and dots show right away, even while the 3D model is still downloading.

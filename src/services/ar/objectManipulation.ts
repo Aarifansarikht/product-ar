@@ -14,6 +14,8 @@ const angleDelta = (a: number, b: number) => Math.atan2(Math.sin(b - a), Math.co
 /** Grab tolerance around the product's bounds, so small items are easy to pick up. */
 const GRAB_PADDING = 0.15
 const MIN_GRAB_SIZE = 0.12
+/** sin(~8°): drag rays closer to parallel with the surface than this are ignored. */
+const MIN_DRAG_RAY_ANGLE_SIN = 0.14
 
 /**
  * Owns the transform of the placed product.
@@ -167,7 +169,7 @@ export class ObjectManipulator {
 
   /** Begin dragging if the touch starts on the product. `ndc` is in normalized device coordinates. */
   beginDrag(ndc: THREE.Vector2, camera: THREE.Camera): boolean {
-    if (!this.hitsObject(ndc, camera) || !this.intersectSurface(ndc, camera)) return false
+    if (!this.hitsObject(ndc, camera) || this.cameraInside(camera) || !this.intersectSurface(ndc, camera)) return false
     this.dragOffset.subVectors(this.target.position, this.hitPoint)
     // Keep only the in-plane part of the grab offset.
     this.dragOffset.addScaledVector(this.plane.normal, -this.dragOffset.dot(this.plane.normal))
@@ -178,8 +180,8 @@ export class ObjectManipulator {
   drag(ndc: THREE.Vector2, camera: THREE.Camera) {
     if (!this.dragging || !this.intersectSurface(ndc, camera)) return
     const next = this.hitPoint.add(this.dragOffset)
-    // Ignore rays that graze the horizon and would fling the product far away.
-    if (next.distanceTo(this.target.position) > 3) return
+    // Ignore jumps that would fling the product far away in one move.
+    if (next.distanceTo(this.target.position) > 0.6) return
     this.plane.projectPoint(next, this.target.position)
   }
 
@@ -203,12 +205,26 @@ export class ObjectManipulator {
     this.group.scale.setScalar(this.current.scale)
   }
 
+  /**
+   * The phone is inside (or right at) the product, as when leaning in for a close look. Every
+   * touch would land on it then, so it is not grabbed: the user is inspecting, not moving it.
+   */
+  private cameraInside(camera: THREE.Camera) {
+    this.group.updateMatrixWorld()
+    this.inverse.copy(this.group.matrixWorld).invert()
+    const local = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld).applyMatrix4(this.inverse)
+    return this.localBounds.distanceToPoint(local) < 0.05
+  }
+
   private intersectSurface(ndc: THREE.Vector2, camera: THREE.Camera) {
     this.raycaster.setFromCamera(ndc, camera)
+    // A ray that grazes the surface (looking almost along it, typical up close) meets it far
+    // away, and each pixel of finger movement would then throw the product metres.
+    if (Math.abs(this.raycaster.ray.direction.dot(this.plane.normal)) < MIN_DRAG_RAY_ANGLE_SIN) return false
     const hit = this.raycaster.ray.intersectPlane(this.plane, this.hitPoint)
     if (!hit) return false
     const camPos = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld)
-    return hit.distanceTo(camPos) < 12
+    return hit.distanceTo(camPos) < 8
   }
 }
 

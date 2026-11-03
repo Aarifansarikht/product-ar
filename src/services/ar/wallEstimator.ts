@@ -19,6 +19,8 @@ const POINT_TTL_MS = 8000
 const INLIER_DISTANCE = 0.03
 const MIN_INLIERS = 7
 const RANSAC_ITERATIONS = 90
+/** Most points used for one wall fit. */
+const MAX_FIT_POINTS = 350
 /** Candidate points must lie within this angle of the query ray. */
 const RAY_CONE_COS = Math.cos(THREE.MathUtils.degToRad(18))
 /** Points within this angle of the view direction count as "ahead" for the depth estimate. */
@@ -35,6 +37,7 @@ const AHEAD_CONE_COS = Math.cos(THREE.MathUtils.degToRad(30))
 export class WallEstimator {
   private readonly points = new Map<number, TrackedPoint>()
   private readonly ray = new THREE.Ray()
+  private readonly raycaster = new THREE.Raycaster()
 
   /** Feed `processCpuResult.reality.worldPoints` (requires `enableWorldPoints`). */
   ingest(worldPoints: unknown, now: number) {
@@ -67,9 +70,8 @@ export class WallEstimator {
 
   /** Fits the wall seen along a camera ray through normalized screen coords (0..1). */
   fitAlongRay(camera: THREE.Camera, screenX: number, screenY: number): WallPlane | null {
-    const raycaster = new THREE.Raycaster()
-    raycaster.setFromCamera(new THREE.Vector2(screenX * 2 - 1, -(screenY * 2 - 1)), camera)
-    this.ray.copy(raycaster.ray)
+    this.raycaster.setFromCamera(new THREE.Vector2(screenX * 2 - 1, -(screenY * 2 - 1)), camera)
+    this.ray.copy(this.raycaster.ray)
     const toPoint = new THREE.Vector3()
     const candidates: THREE.Vector3[] = []
     for (const { position } of this.points.values()) {
@@ -123,9 +125,20 @@ export class WallEstimator {
 
   private fit(candidates: THREE.Vector3[], viewer: THREE.Vector3): WallPlane | null {
     if (candidates.length < MIN_INLIERS) return null
+    // This runs every few frames while aiming; a random subset fits the wall just as well.
+    if (candidates.length > MAX_FIT_POINTS) {
+      for (let i = 0; i < MAX_FIT_POINTS; i++) {
+        const j = i + ((Math.random() * (candidates.length - i)) | 0)
+        ;[candidates[i], candidates[j]] = [candidates[j], candidates[i]]
+      }
+      candidates.length = MAX_FIT_POINTS
+    }
 
-    let bestInliers: THREE.Vector3[] = []
-    const normal = new THREE.Vector3()
+    // Count inliers without allocating per iteration; collect them once for the best plane.
+    let bestCount = 0
+    let bestNx = 0
+    let bestNz = 0
+    let bestD = 0
     for (let i = 0; i < RANSAC_ITERATIONS; i++) {
       const a = candidates[(Math.random() * candidates.length) | 0]
       const b = candidates[(Math.random() * candidates.length) | 0]
@@ -134,12 +147,20 @@ export class WallEstimator {
       const len = Math.hypot(dx, dz)
       if (len < 0.08) continue
       // Vertical plane through a and b: its normal is horizontal and perpendicular to (dx, dz).
-      normal.set(-dz / len, 0, dx / len)
-      const d = -normal.dot(a)
-      const inliers = candidates.filter((p) => Math.abs(normal.dot(p) + d) < INLIER_DISTANCE)
-      if (inliers.length > bestInliers.length) bestInliers = inliers
+      const nx = -dz / len
+      const nz = dx / len
+      const d = -(nx * a.x + nz * a.z)
+      let count = 0
+      for (const p of candidates) if (Math.abs(nx * p.x + nz * p.z + d) < INLIER_DISTANCE) count++
+      if (count > bestCount) {
+        bestCount = count
+        bestNx = nx
+        bestNz = nz
+        bestD = d
+      }
     }
-    if (bestInliers.length < MIN_INLIERS) return null
+    if (bestCount < MIN_INLIERS) return null
+    const bestInliers = candidates.filter((p) => Math.abs(bestNx * p.x + bestNz * p.z + bestD) < INLIER_DISTANCE)
 
     // Least-squares refinement: the wall normal is the direction of least spread in X/Z.
     let cx = 0

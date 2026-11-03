@@ -47,7 +47,7 @@ Products are configured in [src/config/products.ts](src/config/products.ts). Eac
   - The browser draws the camera feed. The app's UI stays on top through the WebXR DOM-overlay feature.
   - Code: `src/services/ar/webxrTracking.ts`.
 - **8th Wall** is the fallback everywhere else (iPhone Safari, phones without ARCore). Add `?engine=8thwall` to the URL to force it for comparison.
-- **Tracking loss:** with either engine, the product is hidden while tracking is lost, so it never shows drifting or at the wrong size.
+- **Tracking loss:** with either engine, the product stays on its anchor while tracking is limited, so it can be inspected up close (where tracking often drops). A warning appears only if tracking stays limited for more than about a second.
 - **Testing native AR on a phone:** the session needs a trusted HTTPS origin. If the self-signed dev certificate makes Chrome fall back to 8th Wall, serve the app through an HTTPS tunnel with a real certificate.
 
 ### 8th Wall pipeline

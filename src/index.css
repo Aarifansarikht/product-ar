@@ -110,6 +110,23 @@
   touch-action: none;
 }
 
+/*
+ * Over the live camera, a backdrop blur is recomputed on every frame for every panel. Together
+ * with world tracking that overheats phones and can crash the tab, so AR panels use a denser
+ * plain fill instead.
+ */
+.ar-live .glass,
+.ar-live .glass-strong,
+.ar-live [class*='backdrop-blur'] {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.ar-live .glass,
+.ar-live .glass-strong {
+  background: linear-gradient(140deg, rgb(14 19 32 / 0.78), rgb(14 19 32 / 0.66));
+}
+
 /* Cinematic ambient background */
 .ambient-bg {
   background:
