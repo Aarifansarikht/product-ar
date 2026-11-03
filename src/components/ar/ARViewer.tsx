@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'framer-motion'
 import { ArrowLeft, Camera, Repeat2 } from 'lucide-react'
 import type { Product } from '../../types/product'
 import { useARSession } from '../../hooks/useARSession'
+import { ARAdjustPad } from './ARAdjustPad'
 import { ARControls } from './ARControls'
 import { ARErrorScreen } from './ARErrorScreen'
 import { ARLoadingScreen } from './ARLoadingScreen'
@@ -112,6 +113,13 @@ export function ARViewer({ product, onExit, onProductChange }: ARViewerProps) {
 
           <ARControls placed={placed} canRotate={current.placement !== 'wall'} onRotate={(d) => session?.rotate(d)} onReset={() => session?.resetPlacement()} onRetrack={() => session?.retrack()} />
           <ARScaleChip scale={state.scale} active={state.grabbing} />
+          <ARAdjustPad
+            show={state.phase === 'surface-found' || placed}
+            placed={placed}
+            wall={current.placement === 'wall'}
+            surfaceOffset={state.surfaceOffset}
+            onNudge={(axis, direction) => session?.nudge(axis, direction)}
+          />
         </>
       )}
 

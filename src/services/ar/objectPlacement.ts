@@ -7,9 +7,10 @@ export interface SurfaceHit {
   surfaceRotation: THREE.Quaternion
   /**
    * Engine hit type; GROUND_PLANE = instant ray-cast onto the tracking ground; WALL_PLANE = fitted
-   * wall; XR_PLANE = a plane detected by native WebXR (ARCore) tracking.
+   * wall; XR_PLANE = a plane detected by native WebXR (ARCore) tracking; ASSUMED_WALL = a wall
+   * facing the camera at an estimated distance (plain walls with nothing tracked on them yet).
    */
-  type: XR8HitTestType | 'GROUND_PLANE' | 'WALL_PLANE' | 'XR_PLANE' | 'XR_POINT'
+  type: XR8HitTestType | 'GROUND_PLANE' | 'WALL_PLANE' | 'XR_PLANE' | 'XR_POINT' | 'ASSUMED_WALL'
   distance: number
   /**
    * Backed by real tracked geometry (feature points or a detected plane). Unconfirmed hits use
@@ -157,6 +158,31 @@ function horizontalHit(
   return groundPlaneHit(camera, screenX, screenY, placement)
 }
 
+/** Screen points around the center that also feed the surface height (more points, sooner). */
+const HEIGHT_SAMPLE_OFFSETS = [
+  [-0.18, 0.05],
+  [0.18, 0.05],
+  [0, 0.15],
+  [-0.1, 0.25],
+  [0.1, 0.25],
+]
+
+/**
+ * Collects feature points across the lower-middle of the view into `height`, so the floor or
+ * table height is measured within moments of tracking — not only when a point happens to lie
+ * exactly under the reticle.
+ */
+export function sampleSurfaceHeight(XR8: XR8Api, camera: THREE.Camera, placement: PlacementType, height: SurfaceHeight) {
+  if (placement === 'wall') return
+  const now = performance.now()
+  const cameraY = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld).y
+  for (const [dx, dy] of HEIGHT_SAMPLE_OFFSETS) {
+    for (const hit of XR8.XrController.hitTest(0.5 + dx, 0.5 + dy, ['FEATURE_POINT'])) {
+      if (hit.distance <= MAX_DISTANCE[placement] && hit.position.y < cameraY - 0.05) height.add(hit.position.y, now)
+    }
+  }
+}
+
 /**
  * Finds the best placement surface at normalized screen coordinates (0..1, origin top-left).
  * Floors and tables use `horizontalHit`; walls use detected vertical planes and feature points.
@@ -248,6 +274,39 @@ export function hitTestSurfaceForPlacement(
   hit.position.copy(origin.addScaledVector(dir, median))
   hit.distance = median
   return hit
+}
+
+/** Typical distance to the wall being aimed at, when nothing on it is tracked yet. */
+export const DEFAULT_WALL_DEPTH = 1.8
+
+/**
+ * Instant wall for plain, featureless walls (which give tracking nothing to measure): a vertical
+ * plane squarely facing the viewer, `depth` metres ahead. The marker can show immediately; art
+ * placed on it is moved onto the real wall as soon as that is measured. `viewDirection` is the
+ * camera's forward direction; `ray` the view ray through the screen point.
+ */
+export function assumedWall(ray: THREE.Ray, viewDirection: THREE.Vector3, depth: number): SurfaceHit | null {
+  const forward = viewDirection.clone().setY(0)
+  if (forward.lengthSq() < 0.05) return null // looking almost straight up or down
+  forward.normalize()
+  const normal = forward.clone().negate()
+  const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, ray.origin.clone().addScaledVector(forward, depth))
+  const point = ray.intersectPlane(plane, new THREE.Vector3())
+  if (!point) return null
+  return {
+    position: point,
+    surfaceRotation: new THREE.Quaternion().setFromUnitVectors(UP, normal),
+    type: 'ASSUMED_WALL',
+    distance: point.distanceTo(ray.origin),
+    confirmed: false,
+  }
+}
+
+/** `assumedWall` through normalized screen coordinates of a Three.js camera. */
+export function assumedWallAt(camera: THREE.Camera, screenX: number, screenY: number, depth: number): SurfaceHit | null {
+  ndc.set(screenX * 2 - 1, -(screenY * 2 - 1))
+  raycaster.setFromCamera(ndc, camera)
+  return assumedWall(raycaster.ray.clone(), camera.getWorldDirection(new THREE.Vector3()), depth)
 }
 
 /** Yaw (around world Y) that turns an object's +Z front toward the camera. */

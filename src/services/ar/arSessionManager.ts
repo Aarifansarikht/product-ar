@@ -9,6 +9,9 @@ import {
   PlacementReticle,
   SurfaceGrid,
   SurfaceHeight,
+  sampleSurfaceHeight,
+  assumedWallAt,
+  DEFAULT_WALL_DEPTH,
   hitTestSurface,
   hitTestSurfaceForPlacement,
   yawFacingCamera,
@@ -70,6 +73,8 @@ export interface ARState {
   /** Product was replaced with one needing a different surface; user must tap again. */
   needsReplacement: boolean
   noSurfaceHint: boolean
+  /** User's floor/table height correction, in metres (shown by the Adjust pad). */
+  surfaceOffset: number
   lowPerformance: boolean
   scale: number
   error: ARError | null
@@ -87,12 +92,19 @@ export const AR_INITIAL_STATE: ARState = {
   grabbing: false,
   needsReplacement: false,
   noSurfaceHint: false,
+  surfaceOffset: 0,
   lowPerformance: false,
   scale: 1,
   error: null,
 }
 
 const NO_SURFACE_HINT_MS = 14_000
+const HEIGHT_SETTLE_MS = 6000
+const NUDGE_STEP = 0.01
+/** The product stays visible through tracking drops shorter than this. */
+const LOST_HIDE_AFTER_MS = 2500
+/** Plain walls can take a while to show any trackable detail, so keep trying longer. */
+const WALL_GUESS_SETTLE_MS = 20_000
 const HIT_TEST_EVERY_N_FRAMES = 2
 const LOW_FPS_THRESHOLD = 20
 /** Rendering above 1.5x buys little on phones and steals frame time from tracking. */
@@ -222,6 +234,18 @@ export class ARSessionManager {
   private readonly wallPoints = new WallPointsView()
   private wallSettleUntil = 0
   private lastHitAt = 0
+  /** A tap that landed before the model finished loading. */
+  private pendingPlacement: { hit: SurfaceHit; placement: Product['placement'] } | null = null
+  /** Until then, a product placed on an assumed height is moved onto the measured surface. */
+  private heightSettleUntil = 0
+  /** Until then, art hung on an assumed wall is moved onto the real wall once it is measured. */
+  private wallGuessUntil = 0
+  /** Distance to the wall ahead, for the assumed wall (last measured, or a typical room distance). */
+  private wallDepth = DEFAULT_WALL_DEPTH
+  /** User correction of the floor/table height (Adjust ↑↓), in metres. */
+  private surfaceOffset = 0
+  /** When tracking was lost (0 = tracking). */
+  private lostSince = 0
   private readonly lights = new THREE.Group()
   private envTexture: THREE.Texture | null = null
   private hemi: THREE.HemisphereLight | null = null
@@ -342,7 +366,7 @@ export class ARSessionManager {
     else this.onTrackingStatus('LIMITED', status === 'initializing' ? 'INITIALIZING' : undefined)
 
     const placement = this.state.product?.placement
-    this.xrHit = placement && !this.manipulator.isPlaced ? tracking.centerHit(frame, placement, this.surfaceHeight) : null
+    this.xrHit = placement && (!this.manipulator.isPlaced || this.heightSettleUntil > performance.now() || this.wallGuessUntil > 0) ? tracking.centerHit(frame, placement, this.surfaceHeight) : null
     const drift = tracking.anchorDrift(frame)
     if (drift && this.manipulator.isPlaced) this.manipulator.shift(drift)
 
@@ -506,8 +530,11 @@ export class ARSessionManager {
     this.xrHit = null
     this.reticle.setHit(null)
     this.wallEstimator.clear()
-    this.surfaceHeight.clear()
+    this.clearSurface()
     this.wallSettleUntil = 0
+    this.heightSettleUntil = 0
+    this.pendingPlacement = null
+    this.wallGuessUntil = 0
     // Native AR keeps its (metric) map of the room; only 8th Wall restarts tracking here.
     this.webxr?.clearAnchor()
     if (this.XR8) {
@@ -516,6 +543,42 @@ export class ARSessionManager {
     }
     this.scanStartedAt = performance.now()
     this.set({ phase: 'scanning', needsReplacement: false, noSurfaceHint: false })
+  }
+
+  /**
+   * Fine adjustment in 1 cm steps. Placed product: `y` raises/lowers it (wall art: up/down the
+   * wall), `x` slides it sideways as seen from the camera (along the wall for art). Before
+   * placing, `y` raises/lowers the floor/table dots when they sit above or below the real surface.
+   * A height change also corrects the surface for later placements.
+   */
+  nudge(axis: 'x' | 'y', direction: 1 | -1) {
+    const product = this.state.product
+    if (!this.xr || !product) return
+    const step = NUDGE_STEP * direction
+    const wall = product.placement === 'wall'
+    if (axis === 'y' && !wall) {
+      this.surfaceOffset += step
+      this.set({ surfaceOffset: Math.round(this.surfaceOffset * 100) / 100 })
+    }
+    if (!this.manipulator.isPlaced) return
+
+    const delta = new THREE.Vector3()
+    if (axis === 'y') {
+      delta.y = step
+    } else {
+      const right = new THREE.Vector3().setFromMatrixColumn(this.xr.camera.matrixWorld, 0)
+      if (wall) {
+        const yaw = this.manipulator.yaw
+        const normal = new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw))
+        right.addScaledVector(normal, -right.dot(normal))
+      }
+      right.setY(0)
+      if (right.lengthSq() < 1e-6) return
+      delta.copy(right.normalize()).multiplyScalar(step)
+    }
+    this.heightSettleUntil = 0 // the user's adjustment wins over automatic height settling
+    this.manipulator.shift(delta)
+    this.webxr?.setAnchor(this.manipulator.position)
   }
 
   resetPlacement() {
@@ -554,7 +617,7 @@ export class ARSessionManager {
   private attachModel(model: LoadedModel, product: Product) {
     const wasPlaced = this.manipulator.isPlaced
     const previousType = this.manipulator.group.userData.placement as Product['placement'] | undefined
-    if (previousType !== product.placement) this.surfaceHeight.clear()
+    if (previousType !== product.placement) this.clearSurface()
 
     this.detachModel()
     if (this.xr) prepareForAR(model.root, this.xr.renderer.capabilities.getMaxAnisotropy())
@@ -577,7 +640,13 @@ export class ARSessionManager {
     })
     this.set({ scale: product.defaultScale })
 
-    if (!wasPlaced) return this.retargetTracking(product.placement)
+    if (!wasPlaced) {
+      this.retargetTracking(product.placement)
+      const pending = this.pendingPlacement
+      this.pendingPlacement = null
+      if (pending?.placement === product.placement) this.place(pending.hit)
+      return
+    }
     if (previousType === product.placement && this.xr) {
       // Same kind of surface: keep the anchor position, reset rotation and scale.
       const yaw = wall
@@ -606,7 +675,7 @@ export class ARSessionManager {
     this.reticle.setHit(null)
     this.applyCameraOrigin()
     this.XR8.XrController.recenter()
-    this.surfaceHeight.clear() // recentering moves the world origin
+    this.clearSurface() // recentering moves the world origin
   }
 
   /** Tells the engine where the camera starts: above the ground, at the typical height. */
@@ -633,8 +702,14 @@ export class ARSessionManager {
   }
 
   private place(hit: SurfaceHit) {
-    if (!this.xr || !this.model || !this.state.product) return
+    if (!this.xr || !this.state.product) return
     const product = this.state.product
+    // Tapped while the 3D model is still downloading: place it there as soon as it is ready.
+    if (!this.model) {
+      this.pendingPlacement = { hit, placement: product.placement }
+      return
+    }
+    this.pendingPlacement = null
     const yaw =
       product.placement === 'wall'
         ? yawFromWall(hit)
@@ -642,6 +717,10 @@ export class ARSessionManager {
     this.manipulator.place(hit.position, yaw, product.defaultScale)
     this.webxr?.setAnchor(hit.position)
     if (product.placement === 'wall' && !this.webxr) this.wallSettleUntil = performance.now() + WALL_SETTLE_MS
+    // Placed on the assumed surface height: drop/raise it onto the real one once it is measured.
+    this.heightSettleUntil = !hit.confirmed && product.placement !== 'wall' ? performance.now() + HEIGHT_SETTLE_MS : 0
+    // Hung on an assumed wall: move onto the real wall once it is measured.
+    this.wallGuessUntil = !hit.confirmed && product.placement === 'wall' ? performance.now() + WALL_GUESS_SETTLE_MS : 0
     this.navigatorVibrate()
     this.set({ phase: 'placed', needsReplacement: false, noSurfaceHint: false, scale: product.defaultScale })
   }
@@ -649,15 +728,31 @@ export class ARSessionManager {
   private handleTap = (clientX: number, clientY: number) => {
     if (!this.xr || !this.state.product || this.state.error) return
     // Once placed, the product stays anchored; it only moves when grabbed and dragged.
-    if (this.manipulator.isPlaced || !this.model) return
+    if (this.manipulator.isPlaced) return
     const { x, y } = this.toScreen(clientX, clientY)
     const fresh = performance.now() - this.lastHitAt < LAST_HIT_MAX_AGE_MS ? this.lastHit : null
     const hit = this.findSurface(x, y) ?? fresh
     if (hit) this.place(hit)
   }
 
-  /** Best surface under a screen point; walls use the fitted plane before raw feature points. */
-  private findSurface(screenX: number, screenY: number, reticle = false): SurfaceHit | null {
+  /**
+   * Best surface under a screen point; walls use the fitted plane before raw feature points, and
+   * (unless `assume` is false) an assumed wall when nothing on the wall is tracked yet.
+   */
+  private findSurface(screenX: number, screenY: number, reticle = false, assume = true): SurfaceHit | null {
+    const hit = this.findRawSurface(screenX, screenY, reticle, assume)
+    if (!hit || !this.surfaceOffset || !this.xr || this.state.product?.placement === 'wall') return hit
+    // The user raised/lowered the dots: slide the hit along the view ray to the adjusted height,
+    // so the marker stays under the screen point.
+    const camPos = this.xr.camera.position
+    const dir = hit.position.clone().sub(camPos)
+    const t = (hit.position.y + this.surfaceOffset - camPos.y) / dir.y
+    if (!Number.isFinite(t) || t <= 0) return hit
+    const position = camPos.clone().addScaledVector(dir, t)
+    return { ...hit, position, distance: position.distanceTo(camPos) }
+  }
+
+  private findRawSurface(screenX: number, screenY: number, reticle: boolean, assume: boolean): SurfaceHit | null {
     // Native AR places where the reticle is: a real detected plane under the screen center.
     if (this.webxr) return this.xrHit
     if (!this.XR8 || !this.xr || !this.state.product) return null
@@ -669,16 +764,86 @@ export class ARSessionManager {
         : hitTestSurfaceForPlacement(this.XR8, camera, screenX, screenY, placement, this.surfaceHeight)
     }
     const wall = this.wallEstimator.fitAlongRay(camera, screenX, screenY)
-    if (wall) {
-      return {
-        position: wall.point,
-        surfaceRotation: new THREE.Quaternion().setFromUnitVectors(UP, wall.normal),
-        type: 'WALL_PLANE',
-        confirmed: true,
-        distance: wall.point.distanceTo(camera.position),
-      }
+    const hit: SurfaceHit | null = wall
+      ? {
+          position: wall.point,
+          surfaceRotation: new THREE.Quaternion().setFromUnitVectors(UP, wall.normal),
+          type: 'WALL_PLANE',
+          confirmed: true,
+          distance: wall.point.distanceTo(camera.position),
+        }
+      : hitTestSurfaceForPlacement(this.XR8, camera, screenX, screenY, placement, this.surfaceHeight)
+    const forward = camera.getWorldDirection(new THREE.Vector3())
+    if (hit) {
+      // Remember how far the real wall is; the assumed wall uses it when tracking loses the wall.
+      const depth = hit.position.clone().sub(camera.position).dot(forward.setY(0).normalize())
+      if (depth > 0.4 && depth < 6) this.wallDepth = depth
+      return hit
     }
-    return hitTestSurfaceForPlacement(this.XR8, camera, screenX, screenY, placement, this.surfaceHeight)
+    if (!assume) return null
+    // Plain wall: estimate its distance from any points ahead, easing so the marker does not jump.
+    const ahead = this.wallEstimator.depthAhead(camera.position, forward, performance.now())
+    if (ahead !== null) this.wallDepth += (ahead - this.wallDepth) * 0.2
+    return assumedWallAt(camera, screenX, screenY, this.wallDepth)
+  }
+
+  /**
+   * Art placed on an assumed wall (plain wall, nothing tracked) moves onto the real wall as soon
+   * as it is measured: along the view ray through the art, so it stays where the user put it on
+   * screen and only its depth and angle are corrected.
+   */
+  private settleGuessedWall(now: number) {
+    if (!this.xr || this.manipulator.isDragging) return
+    if (now > this.wallGuessUntil) {
+      this.wallGuessUntil = 0
+      return
+    }
+    const camera = this.xr.camera
+    let hit: SurfaceHit | null = null
+    if (this.webxr) {
+      hit = this.xrHit // screen-center hit, refreshed every frame while settling
+    } else {
+      const s = this.manipulator.position.clone().project(camera)
+      if (Math.abs(s.x) > 1 || Math.abs(s.y) > 1 || s.z > 1) return // art is off screen
+      hit = this.findSurface((s.x + 1) / 2, (1 - s.y) / 2, false, false)
+    }
+    if (!hit?.confirmed) return
+    const normal = UP.clone().applyQuaternion(hit.surfaceRotation)
+    const wall = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, hit.position)
+    const dir = this.manipulator.position.clone().sub(camera.position).normalize()
+    const onWall = new THREE.Ray(camera.position.clone(), dir).intersectPlane(wall, new THREE.Vector3())
+    if (!onWall || onWall.distanceTo(this.manipulator.position) > 2.5) return // a different surface
+    this.wallGuessUntil = 0
+    this.manipulator.refineAnchor(onWall, Math.atan2(normal.x, normal.z))
+    this.webxr?.setAnchor(onWall)
+    if (!this.webxr) this.wallSettleUntil = now + WALL_SETTLE_MS // keep refining as points accumulate
+  }
+
+  /**
+   * A product placed before the surface was measured keeps sampling it, and moves onto the real
+   * height once known — so it stands on the floor rather than floating above or sinking into it.
+   */
+  private settleHeight(now: number) {
+    const product = this.state.product
+    if (!this.xr || !product || this.manipulator.isDragging) return
+    if (this.XR8) {
+      sampleSurfaceHeight(this.XR8, this.xr.camera, product.placement, this.surfaceHeight)
+      this.findSurface(0.5, 0.5, true) // feeds the height estimate; native AR does this per frame
+    }
+    const measured = this.surfaceHeight.value(now)
+    if (measured === null) return
+    this.heightSettleUntil = 0
+    const dy = measured + this.surfaceOffset - this.manipulator.position.y
+    if (Math.abs(dy) < 0.005 || Math.abs(dy) > 0.6) return // already there / a different surface
+    this.manipulator.shift(new THREE.Vector3(0, dy, 0))
+    this.webxr?.setAnchor(this.manipulator.position)
+  }
+
+  /** Forgets the measured surface height and the user's height correction (new surface). */
+  private clearSurface() {
+    this.surfaceHeight.clear()
+    this.surfaceOffset = 0
+    this.set({ surfaceOffset: 0 })
   }
 
   /** Keeps placed wall art flush with the wall while the estimate improves. */
@@ -698,8 +863,10 @@ export class ARSessionManager {
       onStart: () => this.onStart(),
       onUpdate: ({ processCpuResult }) => this.onUpdate(processCpuResult),
       onCameraStatusChange: ({ status, reason }) => {
-        if (status === 'requesting') this.set({ phase: 'requesting-camera' })
-        else if (status === 'hasVideo' && this.state.phase === 'requesting-camera') {
+        // The camera also restarts after the app was in the background; a placed product stays placed.
+        if (status === 'requesting') {
+          if (!this.manipulator.isPlaced) this.set({ phase: 'requesting-camera' })
+        } else if (status === 'hasVideo' && this.state.phase === 'requesting-camera') {
           this.set({ phase: 'initializing' })
           this.scanStartedAt = performance.now()
         } else if (status === 'failed') {
@@ -795,7 +962,11 @@ export class ARSessionManager {
 
     // While tracking is lost the pose is unreliable: hide the product rather than show it drifting
     // or at the wrong size. It reappears on its anchor as soon as tracking recovers.
-    this.content.visible = this.state.tracking !== 'lost'
+    // Brief drops are common up close (the camera sees mostly plain floor or the area under the
+    // product), so keep showing it on its anchor and hide only if tracking stays lost.
+    if (this.state.tracking !== 'lost') this.lostSince = 0
+    else this.lostSince ||= now
+    this.content.visible = !this.lostSince || now - this.lostSince < LOST_HIDE_AFTER_MS
 
     // Wall fitting from the 8th Wall point cloud; native AR detects vertical planes itself.
     const onWall = this.state.product?.placement === 'wall' && !this.webxr
@@ -807,6 +978,7 @@ export class ARSessionManager {
 
     const placing = !this.manipulator.isPlaced && this.state.phase !== 'error'
     if (placing && this.state.product && this.frame % HIT_TEST_EVERY_N_FRAMES === 0) {
+      if (this.XR8) sampleSurfaceHeight(this.XR8, this.xr.camera, this.state.product.placement, this.surfaceHeight)
       this.lastHit = this.findSurface(0.5, 0.5, true)
       if (this.lastHit) this.lastHitAt = now
       this.reticle.setHit(this.lastHit)
@@ -822,15 +994,19 @@ export class ARSessionManager {
       )
         this.set({ noSurfaceHint: true })
     }
+    if (!placing && this.heightSettleUntil > now && this.frame % HIT_TEST_EVERY_N_FRAMES === 0) this.settleHeight(now)
+    if (!placing && this.wallGuessUntil > 0 && this.frame % 6 === 0) this.settleGuessedWall(now)
 
     const camPos = this.xr.camera.position
-    const showReticle = placing && !!this.model
+    // The reticle and dots show right away, even while the 3D model is still downloading.
+    const showReticle = placing
     this.reticle.update(dt, showReticle, this.reticle.object.position.distanceTo(camPos))
     this.manipulator.update(dt)
 
-    // Dot grid: around the reticle while placing, around the product while it is dragged.
+    // Dot grid: around the reticle while placing, around the product while it is dragged. It
+    // appears on the first frame (assumed height) and glides onto the measured surface.
     const horizontal = this.state.product?.placement !== 'wall'
-    if (horizontal && showReticle && this.lastHit?.confirmed) this.grid.show(this.reticle.object.position)
+    if (horizontal && showReticle && this.lastHit) this.grid.show(this.reticle.object.position)
     else if (horizontal && this.manipulator.isDragging) this.grid.show(this.manipulator.group.position)
     else this.grid.show(null)
     this.grid.update(dt)

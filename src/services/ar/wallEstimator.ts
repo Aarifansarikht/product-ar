@@ -21,6 +21,8 @@ const MIN_INLIERS = 7
 const RANSAC_ITERATIONS = 90
 /** Candidate points must lie within this angle of the query ray. */
 const RAY_CONE_COS = Math.cos(THREE.MathUtils.degToRad(18))
+/** Points within this angle of the view direction count as "ahead" for the depth estimate. */
+const AHEAD_CONE_COS = Math.cos(THREE.MathUtils.degToRad(30))
 
 /**
  * Estimates vertical wall planes from the engine's tracked feature points.
@@ -83,6 +85,28 @@ export class WallEstimator {
     // Reject grazing views where the ray barely meets the wall.
     if (!hit || Math.abs(this.ray.direction.dot(plane.normal)) < 0.25) return null
     return { ...plane, point: hit }
+  }
+
+  /**
+   * Rough distance to whatever is ahead (median horizontal depth of recent points near the view
+   * direction). Too few points to fit a wall can still say how far away it is — e.g. a frame
+   * edge, outlet or the corner of a plain wall.
+   */
+  depthAhead(origin: THREE.Vector3, viewDirection: THREE.Vector3, now: number): number | null {
+    const forward = viewDirection.clone().setY(0)
+    if (forward.lengthSq() < 0.05) return null
+    forward.normalize()
+    const toPoint = new THREE.Vector3()
+    const depths: number[] = []
+    for (const { position, seenAt } of this.points.values()) {
+      if (now - seenAt > 3000) continue
+      toPoint.subVectors(position, origin)
+      const distance = toPoint.length()
+      if (distance < 0.4 || distance > 5 || toPoint.dot(viewDirection) / distance < AHEAD_CONE_COS) continue
+      depths.push(toPoint.dot(forward))
+    }
+    if (depths.length < 3) return null
+    return depths.sort((a, b) => a - b)[Math.floor(depths.length / 2)]
   }
 
   /** Re-fits the wall around an existing anchor (used to settle placed art onto the wall). */

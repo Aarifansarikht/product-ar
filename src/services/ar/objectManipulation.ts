@@ -69,6 +69,10 @@ export class ObjectManipulator {
     return this.target.position
   }
 
+  get yaw() {
+    return this.target.yaw
+  }
+
   configure(options: { scaleMin: number; scaleMax: number; size: THREE.Vector3; wall: boolean }) {
     this.scaleRange = { min: options.scaleMin, max: options.scaleMax }
     this.onWall = options.wall

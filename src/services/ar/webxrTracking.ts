@@ -1,6 +1,6 @@
 import * as THREE from 'three'
 import type { PlacementType } from '../../types/product'
-import { PLANE_TTL_MS, rayOntoHeight, type SurfaceHeight, type SurfaceHit } from './objectPlacement'
+import { DEFAULT_WALL_DEPTH, PLANE_TTL_MS, assumedWall, rayOntoHeight, type SurfaceHeight, type SurfaceHit } from './objectPlacement'
 
 const UP = new THREE.Vector3(0, 1, 0)
 /** cos(~30°): a plane whose normal deviates more than this is not horizontal. */
@@ -8,6 +8,8 @@ const MIN_UP_DOT = 0.86
 /** A plane is a wall when its normal is within ~20° of horizontal. */
 const MAX_WALL_UP_DOT = 0.35
 const MAX_DISTANCE: Record<PlacementType, number> = { floor: 10, tabletop: 4, wall: 6 }
+/** Typical phone height above the surface (standing over a floor / above a table), in metres. */
+const ASSUMED_DROP: Record<Exclude<PlacementType, 'wall'>, number> = { floor: 1.35, tabletop: 0.4 }
 
 export type WebXRTrackingStatus = 'initializing' | 'normal' | 'lost'
 
@@ -37,6 +39,7 @@ export class WebXRTracking {
   private readonly viewerPosition = new THREE.Vector3()
   /** Ray through the screen center, from this frame's viewer pose. */
   private readonly centerRay = new THREE.Ray()
+  private wallDepth = DEFAULT_WALL_DEPTH
 
   private anchor: XRAnchor | null = null
   private anchorRequest = 0
@@ -50,6 +53,9 @@ export class WebXRTracking {
     this.renderer = new THREE.WebGLRenderer({ canvas: document.createElement('canvas'), alpha: true, antialias: true })
     this.renderer.xr.enabled = true
     this.renderer.xr.setReferenceSpaceType('local')
+    // Clip only what is closer than 1 cm, so the product can be inspected up close (Three's
+    // default 10 cm cuts into it). WebXRManager passes this to the session as depthNear.
+    this.camera.near = 0.01
   }
 
   /** Requests the immersive session. Call while the user's tap still counts as a gesture. */
@@ -100,28 +106,47 @@ export class WebXRTracking {
     if (!space) return null
     const now = performance.now()
     const plane = this.planeHit(frame, space, placement, height, now)
-    if (plane) return plane
+    if (plane) {
+      if (placement === 'wall') this.rememberWallDepth(plane.position)
+      return plane
+    }
 
     const point = this.pointSource && frame.getHitTestResults(this.pointSource)[0]?.getPose(space)?.transform.position
     const position = point ? new THREE.Vector3(point.x, point.y, point.z) : null
     if (placement === 'wall') {
-      if (!position || position.distanceTo(this.viewerPosition) > MAX_DISTANCE.wall) return null
-      const normal = this.viewerPosition.clone().sub(position).setY(0)
-      if (normal.lengthSq() < 1e-6) return null
-      const surfaceRotation = new THREE.Quaternion().setFromUnitVectors(UP, normal.normalize())
-      return { position, surfaceRotation, type: 'XR_POINT', distance: position.distanceTo(this.viewerPosition), confirmed: true }
+      const normal = position && this.viewerPosition.clone().sub(position).setY(0)
+      if (position && normal && normal.lengthSq() > 1e-6 && position.distanceTo(this.viewerPosition) <= MAX_DISTANCE.wall) {
+        this.rememberWallDepth(position)
+        const surfaceRotation = new THREE.Quaternion().setFromUnitVectors(UP, normal.normalize())
+        return { position, surfaceRotation, type: 'XR_POINT', distance: position.distanceTo(this.viewerPosition), confirmed: true }
+      }
+      // Plain wall, nothing tracked on it yet: an assumed wall facing the viewer, so the marker
+      // still shows; placed art is moved onto the real wall once ARCore finds it.
+      return this.hadPose ? assumedWall(this.centerRay.clone(), this.centerRay.direction, this.wallDepth) : null
     }
     if (position && position.y < this.viewerPosition.y - 0.05) height.add(position.y, now)
     const measured = height.value(now)
-    const onSurface = measured !== null ? rayOntoHeight(this.centerRay, measured, placement) : null
+    // Until ARCore reports points (plain floors can take a moment), show the surface at the
+    // typical height below the phone, so the reticle and dots appear right away. Distances are
+    // metric, so this is close; it snaps onto the measured height as soon as points arrive.
+    const surfaceY = measured ?? (this.hadPose ? this.viewerPosition.y - ASSUMED_DROP[placement] : null)
+    const onSurface = surfaceY !== null ? rayOntoHeight(this.centerRay, surfaceY, placement) : null
     if (!onSurface) return null
     return {
       position: onSurface,
       surfaceRotation: new THREE.Quaternion(),
       type: 'XR_POINT',
       distance: onSurface.distanceTo(this.viewerPosition),
-      confirmed: true,
+      confirmed: measured !== null,
     }
+  }
+
+  /** The assumed wall uses the distance of the last real wall seen (walls do not move). */
+  private rememberWallDepth(point: THREE.Vector3) {
+    const forward = this.centerRay.direction.clone().setY(0)
+    if (forward.lengthSq() < 0.05) return
+    const depth = point.clone().sub(this.viewerPosition).dot(forward.normalize())
+    if (depth > 0.4 && depth < MAX_DISTANCE.wall) this.wallDepth = depth
   }
 
   /** Nearest detected plane under the screen center that suits the placement type. */
